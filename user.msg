@@ -342,3 +342,5 @@ data "aws_ami" "ubuntu_arm" {
     values = ["hvm"]
   }
 }""" assumes t4g.small instance type with ARM cpu. Validate CPU / AMI compatibility before finalizing the terraform config.
+
+Finally, generate a new single-file main.tf with the backend code defined in-line.
