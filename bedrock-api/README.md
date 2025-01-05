@@ -42,8 +42,8 @@ terraform apply
 curl -X POST https://your-api-url/invoke \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Hello, how are you?",
-    "model_id": "meta.llama2-70b-chat-v1",
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
     "max_tokens": 1000,
     "temperature": 0.7
   }'
