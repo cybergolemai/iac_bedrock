@@ -102,6 +102,7 @@ def lambda_handler(event, context):
         # Prepare request for Bedrock with Llama-specific format
         request_body = json.dumps({
             "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
             "prompt": prompt,
             "max_gen_len": max_tokens,
             "temperature": temperature,
@@ -233,4 +234,4 @@ What is the desired duration for your CloudWatch log group retention?
 Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
 Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
 
-After each question has been answered: move to the next question. These 6 questions are the only 6.
+After each question has been answered: move to the next question. These 6 questions are the only 6. Once you have all 6 guardrails, generate a new single-file main.tf with the lambda code defined in-line.

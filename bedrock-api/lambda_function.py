@@ -26,6 +26,7 @@ def lambda_handler(event, context):
         # Prepare request for Bedrock with Llama-specific format
         request_body = json.dumps({
             "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
             "prompt": prompt,
             "max_gen_len": max_tokens,  # Llama uses max_gen_len instead of max_tokens
             "temperature": temperature,

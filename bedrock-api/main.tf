@@ -49,6 +49,7 @@ def lambda_handler(event, context):
         # Prepare request for Bedrock with specific prompt ARN
         request_body = json.dumps({
             "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
             "prompt": prompt,
             "max_tokens_to_sample": max_tokens,
             "temperature": temperature
