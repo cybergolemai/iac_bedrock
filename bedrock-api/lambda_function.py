@@ -13,8 +13,8 @@ def lambda_handler(event, context):
         # Parse request body
         body = json.loads(event['body'])
         prompt = body.get('prompt')
-        model_id = body.get('model_id', 'anthropic.claude-v2')
-        max_tokens = body.get('max_tokens', 1000)
+        model_id = body.get('model_id', 'meta.llama3-2-90b-instruct-v1:0')
+        max_tokens = body.get('max_tokens', 4000)
         temperature = body.get('temperature', 0.7)
         
         if not prompt:
@@ -23,11 +23,13 @@ def lambda_handler(event, context):
                 'body': json.dumps({'error': 'prompt is required'})
             }
         
-        # Prepare request for Bedrock
+        # Prepare request for Bedrock with Llama-specific format
         request_body = json.dumps({
-            "prompt": f"\n\nHuman: {prompt}\n\nAssistant:",
-            "max_tokens": max_tokens,
-            "temperature": temperature
+            "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "prompt": prompt,
+            "max_gen_len": max_tokens,  # Llama uses max_gen_len instead of max_tokens
+            "temperature": temperature,
+            "top_p": 0.9  # Common Llama parameter
         })
         
         # Invoke Bedrock model
@@ -38,8 +40,9 @@ def lambda_handler(event, context):
             body=request_body
         )
         
-        # Parse response
+        # Parse response - Llama response structure is different
         response_body = json.loads(response['body'].read())
+        completion = response_body.get('generation', '')  # Llama uses 'generation' instead of 'completion'
         
         return {
             'statusCode': 200,
@@ -48,7 +51,7 @@ def lambda_handler(event, context):
                 'Access-Control-Allow-Origin': '*'
             },
             'body': json.dumps({
-                'completion': response_body.get('completion'),
+                'completion': completion,
                 'model': model_id
             })
         }
