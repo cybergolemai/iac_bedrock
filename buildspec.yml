@@ -1,0 +1,36 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.11
+    commands:
+      - pip install --upgrade pip
+      - pip install terraform-validator boto3
+      - curl -fsSL https://apt.releases.hashicorp.com/gpg | apt-key add -
+      - apt-add-repository "deb [arch=amd64] https://apt.releases.hashicorp.com $(lsb_release -cs) main"
+      - apt-get update && apt-get install -y terraform
+
+  pre_build:
+    commands:
+      - terraform init
+      - terraform validate
+      - terraform plan -out=tfplan
+
+  build:
+    commands:
+      - terraform apply -auto-approve tfplan
+
+  post_build:
+    commands:
+      - aws lambda update-function-code --function-name bedrock-api --zip-file fileb://lambda_function.zip
+      - aws apigateway create-deployment --rest-api-id $(terraform output -raw api_id) --stage-name api
+
+artifacts:
+  files:
+    - '**/*'
+  base-directory: '.'
+
+cache:
+  paths:
+    - '/root/.terraform/**/*'
