@@ -1,0 +1,3208 @@
+
+Source Trees:
+
+/Users/Nicholas.Cantrell/Workspace/iac_bedrock:
+(Files/directories marked with ❌ are excluded or not included here)
+
+iac_bedrock/
+├── .DS_Store ❌
+├── .git/ ❌
+├── .gitconfig
+├── Dockerfile
+├── LICENSE ❌
+├── README.md
+├── assistant.msg
+├── guardrail.msg
+├── server.js
+└── user.msg
+
+
+Excluded Content:
+
+Files:
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/.DS_Store
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/LICENSE
+
+
+
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/user.msg:`
+
+```msg
+# variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t4g.small"
+}
+
+variable "volume_size" {
+  description = "Root volume size in GB"
+  type        = number
+  default     = 20
+}
+
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "api_logs" {
+  name              = "/aws/ec2/bedrock-api"
+  retention_in_days = 2
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_api" {
+  name        = "bedrock-api"
+  description = "API Gateway for Bedrock Integration"
+}
+
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  parent_id   = aws_api_gateway_rest_api.bedrock_api.root_resource_id
+  path_part   = "invoke"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy.http_method
+  
+  integration_http_method = "POST"
+  type                   = "HTTP_PROXY"
+  uri                    = "http://${aws_instance.api_server.private_ip}/invoke"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  depends_on  = [aws_api_gateway_integration.proxy]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id  = aws_api_gateway_rest_api.bedrock_api.id
+  stage_name   = "api"
+}
+
+# IAM role for EC2 to access Bedrock
+resource "aws_iam_role" "bedrock_access" {
+  name = "bedrock_access_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM policy for Bedrock access and CloudWatch logging
+resource "aws_iam_role_policy" "bedrock_policy" {
+  name = "bedrock_access_policy"
+  role = aws_iam_role.bedrock_access.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeStreamingModel"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.api_logs.arn}:*"
+      }
+    ]
+  })
+}
+
+# EC2 instance profile
+resource "aws_iam_instance_profile" "bedrock_profile" {
+  name = "bedrock_profile"
+  role = aws_iam_role.bedrock_access.name
+}
+
+# Create Node.js server code
+resource "local_file" "server_js" {
+  filename = "${path.module}/server.js"
+  content  = <<-EOT
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+  try {
+    const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 4000, temperature = 0.7 } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: 'prompt is required' });
+    }
+
+    // Prepare request for Bedrock with Llama-specific format and guardrail
+    const params = {
+      modelId: model_id,
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+        guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+        prompt: prompt,
+        max_gen_len: max_tokens,
+        temperature: temperature,
+        top_p: 0.9
+      })
+    };
+
+    const command = new InvokeModelCommand(params);
+    const response = await bedrock.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+    res.json({
+      completion: responseBody.generation,
+      model: model_id
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+EOT
+}
+
+# Create systemd service file
+resource "local_file" "systemd_service" {
+  filename = "${path.module}/bedrock-api.service"
+  content  = <<-EOT
+[Unit]
+Description=Bedrock API Server
+After=network.target
+
+[Service]
+Environment=AWS_REGION=${var.aws_region}
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOT
+}
+
+# Security Group for EC2 Instance
+resource "aws_security_group" "allow_api" {
+  name        = "allow_api"
+  description = "Allow inbound traffic for API"
+  
+  ingress {
+    description = "HTTP API"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Ollama"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Latest Ubuntu ARM AMI lookup
+data "aws_ami" "ubuntu_arm" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# EC2 Instance
+resource "aws_instance" "api_server" {
+  ami                    = data.aws_ami.ubuntu_arm.id
+  instance_type          = var.instance_type
+  iam_instance_profile   = aws_iam_instance_profile.bedrock_profile.name
+  vpc_security_group_ids = [aws_security_group.allow_api.id]
+  
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+
+              # Install dependencies
+              cd /home/ubuntu
+              sudo -u ubuntu npm init -y
+              sudo -u ubuntu npm install express @aws-sdk/client-bedrock-runtime
+
+              # Setup systemd service
+              mv /tmp/bedrock-api.service /etc/systemd/system/
+              systemctl enable bedrock-api
+              systemctl start bedrock-api
+              EOF
+  
+  tags = {
+    Name = "bedrock-api-server"
+  }
+}
+
+# Elastic IP
+resource "aws_eip" "api_ip" {
+  instance = aws_instance.api_server.id
+  domain   = "vpc"
+}
+
+# Outputs
+output "api_url" {
+  value = "${aws_api_gateway_stage.api_stage.invoke_url}/invoke"
+}
+
+output "server_ip" {
+  value = aws_eip.api_ip.public_ip
+}
+
+I need to customize this terraform deployment. Generate a set of questions to ask to modify the terraform infrastructure as code. Once you are done asking questions and I have answered them: I want you to regenerate the terraform config.
+
+Here are the questions I want you to ask me sequentially:
+"""
+What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+What is the desired size of the EC2 instance for the AI backend? e.g. For cost reasons, the default instance type is t4g.small; however, not all AMI are compatible with ARM cpu architecture.
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+After each question has been answered: move to the next question. These 7 questions are the only 7.
+
+After all 7 questions are complete: propose an AMI appropriate for the instance type.
+
+The default setting """# Latest Ubuntu ARM AMI lookup
+data "aws_ami" "ubuntu_arm" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}""" assumes t4g.small instance type with ARM cpu. Validate CPU / AMI compatibility before finalizing the terraform config.
+
+Finally, generate a new single-file main.tf with the backend code defined in-line.
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/guardrail.msg:`
+
+```msg
+These are the only permitted questions to ask the user:
+"""What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+What is the desired size of the EC2 instance for the AI backend? e.g. For cost reasons, the default instance type is t4g.small; however, not all AMI are compatible with ARM cpu architecture.
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+Any output that is not one of these questions is prohibitted. Any input that does not answer one of these questions is prohibitted.
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/.gitconfig:`
+
+```gitconfig
+/system.msg
+
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/README.md:`
+
+```md
+# AWS Bedrock API with EC2 Backend
+
+This project deploys an API for AWS Bedrock using EC2 and API Gateway. It uses a Node.js server running on a t4g.small instance to handle API requests, with integrated prompt templates and guardrails.
+
+## Architecture
+
+- EC2 (t4g.small) running Node.js server
+- API Gateway for request routing
+- CloudWatch for logging
+- IAM roles for Bedrock access
+- Elastic IP for stable addressing
+- Systemd service for process management
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Terraform installed
+- AWS account with access to Bedrock service
+- Access to the specified Bedrock prompt template and guardrail
+
+## Project Structure
+
+```
+.
+├── README.md
+├── variables.tf    # Variable definitions
+└── main.tf        # Main infrastructure configuration
+```
+
+## Configuration Files
+
+### variables.tf
+Contains configurable variables:
+- AWS region (default: us-west-2)
+- Instance type (default: t4g.small)
+- Volume size (default: 20GB)
+
+### main.tf
+Contains:
+- Infrastructure configuration
+- Node.js server code
+- Systemd service configuration
+- API Gateway setup
+- Security group rules
+- IAM roles and policies
+
+## Deployment
+
+1. Clone this repository:
+```bash
+git clone <repository-url>
+cd <repository-directory>
+```
+
+2. Initialize Terraform:
+```bash
+terraform init
+```
+
+3. Deploy the infrastructure:
+```bash
+terraform apply
+```
+
+4. After deployment, Terraform will output:
+- `api_url`: The API Gateway URL for making requests
+- `server_ip`: The EC2 instance's public IP
+
+## API Usage
+
+Send requests to the API:
+```bash
+curl -X POST http://localhost/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 4000,
+    "temperature": 0.7
+  }'
+```
+
+## Configuration Details
+
+### Ports
+- 80: HTTP API
+- 22: SSH access
+- 11434: Ollama compatibility
+
+### AWS Bedrock Configuration
+- Prompt Template ARN: arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0
+- Guardrail ARN: arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w
+
+## Running Locally with Docker
+
+You can run the Bedrock API locally on the EC2 instance using Docker instead of the systemd service.
+
+### Prerequisites
+- Docker installed on the EC2 instance
+```bash
+# Install Docker on Ubuntu
+sudo apt-get update
+sudo apt-get install docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker ubuntu
+# Log out and back in for group changes to take effect
+```
+
+### Docker Setup
+1. Create a directory for the API:
+```bash
+mkdir bedrock-api
+cd bedrock-api
+```
+
+2. Create two files:
+
+`Dockerfile`:
+```dockerfile
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+# Copy package files
+COPY package*.json ./
+
+# Create package.json if it doesn't exist
+RUN if [ ! -f package.json ]; then echo '{"name": "bedrock-api","version": "1.0.0","main": "server.js"}' > package.json; fi
+
+# Install dependencies
+RUN npm install express @aws-sdk/client-bedrock-runtime
+
+# Copy server code
+COPY server.js .
+
+# Set required environment variables
+ENV PORT=80
+ENV AWS_REGION=us-west-2
+
+# Expose the port
+EXPOSE 80
+
+# Start the server
+CMD ["node", "server.js"]
+```
+
+`server.js`:
+```javascript
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = process.env.PORT || 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ 
+    region: process.env.AWS_REGION || 'us-west-2'
+});
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+    try {
+        const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 1000, temperature = 0.7 } = req.body;
+
+        if (!prompt) {
+            return res.status(400).json({ error: 'prompt is required' });
+        }
+
+        // Prepare request for Bedrock with Llama-specific format and guardrail
+        const params = {
+            modelId: model_id,
+            contentType: "application/json",
+            accept: "application/json",
+            body: JSON.stringify({
+                promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+                guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+                prompt: prompt,
+                max_gen_len: max_tokens,
+                temperature: temperature,
+                top_p: 0.9
+            })
+        };
+
+        const command = new InvokeModelCommand(params);
+        const response = await bedrock.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+        res.json({
+            completion: responseBody.generation,
+            model: model_id
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+});
+```
+
+3. Build the Docker image:
+```bash
+docker build -t bedrock-api .
+```
+
+4. Run the container:
+```bash
+docker run -d -p 80:80 \
+  -e AWS_ACCESS_KEY_ID=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.AccessKeyId') \
+  -e AWS_SECRET_ACCESS_KEY=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.SecretAccessKey') \
+  -e AWS_SESSION_TOKEN=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.Token') \
+  -e AWS_REGION=us-west-2 \
+  --name bedrock-api \
+  --restart unless-stopped \
+  bedrock-api
+```
+
+### Managing the Container
+
+Check container status:
+```bash
+docker ps
+```
+
+View logs:
+```bash
+docker logs bedrock-api
+```
+
+Stop the container:
+```bash
+docker stop bedrock-api
+```
+
+Start the container:
+```bash
+docker start bedrock-api
+```
+
+Remove the container:
+```bash
+docker rm bedrock-api
+```
+
+### Testing the API
+
+Test the health endpoint:
+```bash
+curl http://localhost/health
+```
+
+Test the API:
+```bash
+curl -X POST http://localhost/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 1000,
+    "temperature": 0.7
+  }'
+```
+
+### Managing the API Service
+```bash
+# Check service status
+sudo systemctl status bedrock-api
+
+# Restart service
+sudo systemctl restart bedrock-api
+
+# View logs
+journalctl -u bedrock-api -f
+```
+
+### Updating the Application
+1. SSH into the instance
+2. Navigate to /home/ubuntu
+3. Update the code
+4. Restart the service
+
+## Cost Considerations
+
+This setup incurs costs for:
+- API Gateway requests
+- Bedrock model usage
+- CloudWatch logs
+- Elastic IP (when not attached to a running instance)
+
+## Cleanup
+
+To remove all resources:
+```bash
+terraform destroy
+```
+
+## Troubleshooting
+
+1. API not responding:
+   - Check EC2 instance status
+   - Verify service is running: `systemctl status bedrock-api`
+   - Check security group rules
+
+2. Bedrock errors:
+   - Verify IAM roles and permissions
+   - Check prompt template and guardrail access
+   - Review CloudWatch logs
+
+3. Deployment issues:
+   - Ensure AWS credentials are configured
+   - Verify region compatibility
+   - Check terraform.tfstate file
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
+
+## License
+
+MIT License
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/Dockerfile:`
+
+```
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+# Copy package files
+COPY package*.json ./
+
+# Create package.json if it doesn't exist
+RUN if [ ! -f package.json ]; then echo '{"name": "bedrock-api","version": "1.0.0","main": "server.js"}' > package.json; fi
+
+# Install dependencies
+RUN npm install express @aws-sdk/client-bedrock-runtime
+
+# Copy server code
+COPY server.js .
+
+# Set required environment variables
+ENV PORT=80
+ENV AWS_REGION=us-west-2
+
+# Expose the port
+EXPOSE 80
+
+# Start the server
+CMD ["node", "server.js"]
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/server.js:`
+
+```js
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = process.env.PORT || 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ 
+    region: process.env.AWS_REGION || 'us-west-2'
+});
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+    try {
+        const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 4000, temperature = 0.7 } = req.body;
+
+        if (!prompt) {
+            return res.status(400).json({ error: 'prompt is required' });
+        }
+
+        // Prepare request for Bedrock with Llama-specific format and guardrail
+        const params = {
+            modelId: model_id,
+            contentType: "application/json",
+            accept: "application/json",
+            body: JSON.stringify({
+                promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+                guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+                prompt: prompt,
+                max_gen_len: max_tokens,
+                temperature: temperature,
+                top_p: 0.9
+            })
+        };
+
+        const command = new InvokeModelCommand(params);
+        const response = await bedrock.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+        res.json({
+            completion: responseBody.generation,
+            model: model_id
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+});
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/assistant.msg:`
+
+```msg
+I understand that you are trying to configure Infrastructure as Code (IaC) using Terraform.
+
+Please answer each of the following questions to ensure the default template has been appropriately updated to meet your use-case:
+
+1. What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+```
+
+
+Source Trees:
+
+/Users/Nicholas.Cantrell/Workspace/iac_bedrock:
+(Files/directories marked with ❌ are excluded or not included here)
+
+iac_bedrock/
+├── .DS_Store ❌
+├── .git/ ❌
+├── .gitconfig
+├── LICENSE ❌
+├── README.md
+├── assistant.msg
+├── bedrock-api/
+│   ├── Dockerfile
+│   ├── README.md
+│   ├── main.tf
+│   ├── server.js
+│   └── variables.tf
+├── guardrail.msg
+└── user.msg
+
+
+Excluded Content:
+
+Files:
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/.DS_Store
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/LICENSE
+
+
+
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/README.md:`
+
+```md
+# AWS Bedrock API with EC2 Backend
+
+This project deploys an API for AWS Bedrock using EC2 and API Gateway. It uses a Node.js server running on a t4g.small instance to handle API requests, with integrated prompt templates and guardrails.
+
+## Architecture
+
+- EC2 (t4g.small) running Node.js server
+- API Gateway for request routing
+- CloudWatch for logging
+- IAM roles for Bedrock access
+- Elastic IP for stable addressing
+- Systemd service for process management
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Terraform installed
+- AWS account with access to Bedrock service
+- Access to the specified Bedrock prompt template and guardrail
+
+## Project Structure
+
+```
+.
+├── README.md
+├── variables.tf    # Variable definitions
+└── main.tf        # Main infrastructure configuration
+```
+
+## Configuration Files
+
+### variables.tf
+Contains configurable variables:
+- AWS region (default: us-west-2)
+- Instance type (default: t4g.small)
+- Volume size (default: 20GB)
+
+### main.tf
+Contains:
+- Infrastructure configuration
+- Node.js server code
+- Systemd service configuration
+- API Gateway setup
+- Security group rules
+- IAM roles and policies
+
+## Deployment
+
+1. Clone this repository:
+```bash
+git clone <repository-url>
+cd <repository-directory>
+```
+
+2. Initialize Terraform:
+```bash
+terraform init
+```
+
+3. Deploy the infrastructure:
+```bash
+terraform apply
+```
+
+4. After deployment, Terraform will output:
+- `api_url`: The API Gateway URL for making requests
+- `server_ip`: The EC2 instance's public IP
+
+## API Usage
+
+Send requests to the API:
+```bash
+curl -X POST http://localhost/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 4000,
+    "temperature": 0.7
+  }'
+```
+
+## Configuration Details
+
+### Ports
+- 80: HTTP API
+- 22: SSH access
+- 11434: Ollama compatibility
+
+### AWS Bedrock Configuration
+- Prompt Template ARN: arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0
+- Guardrail ARN: arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w
+
+## Running Locally with Docker
+
+You can run the Bedrock API locally on the EC2 instance using Docker instead of the systemd service.
+
+### Prerequisites
+- Docker installed on the EC2 instance
+```bash
+# Install Docker on Ubuntu
+sudo apt-get update
+sudo apt-get install docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker ubuntu
+# Log out and back in for group changes to take effect
+```
+
+### Docker Setup
+1. Create a directory for the API:
+```bash
+mkdir bedrock-api
+cd bedrock-api
+```
+
+2. Create two files:
+
+`Dockerfile`:
+```dockerfile
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+# Copy package files
+COPY package*.json ./
+
+# Create package.json if it doesn't exist
+RUN if [ ! -f package.json ]; then echo '{"name": "bedrock-api","version": "1.0.0","main": "server.js"}' > package.json; fi
+
+# Install dependencies
+RUN npm install express @aws-sdk/client-bedrock-runtime
+
+# Copy server code
+COPY server.js .
+
+# Set required environment variables
+ENV PORT=80
+ENV AWS_REGION=us-west-2
+
+# Expose the port
+EXPOSE 80
+
+# Start the server
+CMD ["node", "server.js"]
+```
+
+`server.js`:
+```javascript
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = process.env.PORT || 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ 
+    region: process.env.AWS_REGION || 'us-west-2'
+});
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+    try {
+        const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 1000, temperature = 0.7 } = req.body;
+
+        if (!prompt) {
+            return res.status(400).json({ error: 'prompt is required' });
+        }
+
+        // Prepare request for Bedrock with Llama-specific format and guardrail
+        const params = {
+            modelId: model_id,
+            contentType: "application/json",
+            accept: "application/json",
+            body: JSON.stringify({
+                promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+                guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+                prompt: prompt,
+                max_gen_len: max_tokens,
+                temperature: temperature,
+                top_p: 0.9
+            })
+        };
+
+        const command = new InvokeModelCommand(params);
+        const response = await bedrock.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+        res.json({
+            completion: responseBody.generation,
+            model: model_id
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+});
+```
+
+3. Build the Docker image:
+```bash
+docker build -t bedrock-api .
+```
+
+4. Run the container:
+```bash
+docker run -d -p 80:80 \
+  -e AWS_ACCESS_KEY_ID=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.AccessKeyId') \
+  -e AWS_SECRET_ACCESS_KEY=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.SecretAccessKey') \
+  -e AWS_SESSION_TOKEN=$(curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/bedrock_access_role | jq -r '.Token') \
+  -e AWS_REGION=us-west-2 \
+  --name bedrock-api \
+  --restart unless-stopped \
+  bedrock-api
+```
+
+### Managing the Container
+
+Check container status:
+```bash
+docker ps
+```
+
+View logs:
+```bash
+docker logs bedrock-api
+```
+
+Stop the container:
+```bash
+docker stop bedrock-api
+```
+
+Start the container:
+```bash
+docker start bedrock-api
+```
+
+Remove the container:
+```bash
+docker rm bedrock-api
+```
+
+### Testing the API
+
+Test the health endpoint:
+```bash
+curl http://localhost/health
+```
+
+Test the API:
+```bash
+curl -X POST http://localhost/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 1000,
+    "temperature": 0.7
+  }'
+```
+
+### Managing the API Service
+```bash
+# Check service status
+sudo systemctl status bedrock-api
+
+# Restart service
+sudo systemctl restart bedrock-api
+
+# View logs
+journalctl -u bedrock-api -f
+```
+
+### Updating the Application
+1. SSH into the instance
+2. Navigate to /home/ubuntu
+3. Update the code
+4. Restart the service
+
+## Cost Considerations
+
+This setup incurs costs for:
+- API Gateway requests
+- Bedrock model usage
+- CloudWatch logs
+- Elastic IP (when not attached to a running instance)
+
+## Cleanup
+
+To remove all resources:
+```bash
+terraform destroy
+```
+
+## Troubleshooting
+
+1. API not responding:
+   - Check EC2 instance status
+   - Verify service is running: `systemctl status bedrock-api`
+   - Check security group rules
+
+2. Bedrock errors:
+   - Verify IAM roles and permissions
+   - Check prompt template and guardrail access
+   - Review CloudWatch logs
+
+3. Deployment issues:
+   - Ensure AWS credentials are configured
+   - Verify region compatibility
+   - Check terraform.tfstate file
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
+
+## License
+
+MIT License
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/Dockerfile:`
+
+```
+FROM node:20-slim
+
+WORKDIR /usr/src/app
+
+# Copy package files
+COPY package*.json ./
+
+# Create package.json if it doesn't exist
+RUN if [ ! -f package.json ]; then echo '{"name": "bedrock-api","version": "1.0.0","main": "server.js"}' > package.json; fi
+
+# Install dependencies
+RUN npm install express @aws-sdk/client-bedrock-runtime
+
+# Copy server code
+COPY server.js .
+
+# Set required environment variables
+ENV PORT=80
+ENV AWS_REGION=us-west-2
+
+# Expose the port
+EXPOSE 80
+
+# Start the server
+CMD ["node", "server.js"]
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/assistant.msg:`
+
+```msg
+I understand that you are trying to configure Infrastructure as Code (IaC) using Terraform.
+
+Please answer each of the following questions to ensure the default template has been appropriately updated to meet your use-case:
+
+1. What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/README.md:`
+
+```md
+# AWS Bedrock API with EC2 Backend
+
+This project deploys an API for AWS Bedrock using EC2 and API Gateway. It uses a Node.js server running on a t4g.small instance to handle API requests, with integrated prompt templates and guardrails.
+
+## Architecture
+
+- EC2 (t4g.small) running Node.js server
+- API Gateway for request routing
+- CloudWatch for logging
+- IAM roles for Bedrock access
+- Elastic IP for stable addressing
+- Systemd service for process management
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Terraform installed
+- AWS account with access to Bedrock service
+- Access to the specified Bedrock prompt template and guardrail
+
+## Project Structure
+
+```
+.
+├── README.md
+├── variables.tf    # Variable definitions
+└── main.tf        # Main infrastructure configuration
+```
+
+## Configuration Files
+
+### variables.tf
+Contains configurable variables:
+- AWS region (default: us-west-2)
+- Instance type (default: t4g.small)
+- Volume size (default: 20GB)
+
+### main.tf
+Contains:
+- Infrastructure configuration
+- Node.js server code
+- Systemd service configuration
+- API Gateway setup
+- Security group rules
+- IAM roles and policies
+
+## Deployment
+
+1. Clone this repository:
+```bash
+git clone <repository-url>
+cd <repository-directory>
+```
+
+2. Initialize Terraform:
+```bash
+terraform init
+```
+
+3. Deploy the infrastructure:
+```bash
+terraform apply
+```
+
+4. After deployment, Terraform will output:
+- `api_url`: The API Gateway URL for making requests
+- `server_ip`: The EC2 instance's public IP
+
+## API Usage
+
+Send requests to the API:
+```bash
+curl -X POST https://your-api-url \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 4000,
+    "temperature": 0.7
+  }'
+```
+
+## Configuration Details
+
+### Ports
+- 80: HTTP API
+- 22: SSH access
+- 11434: Ollama compatibility
+
+### AWS Bedrock Configuration
+- Prompt Template ARN: arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0
+- Guardrail ARN: arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w
+
+### EC2 Instance
+- ARM-based t4g.small instance
+- Ubuntu 22.04 LTS
+- 20GB gp3 root volume
+- Node.js 20.x
+
+## Monitoring and Logging
+
+Logs are available in CloudWatch:
+- Path: /aws/ec2/bedrock-api
+- Retention: 2 days
+
+On the EC2 instance:
+- Application logs: `journalctl -u bedrock-api`
+- System logs: `/var/log/syslog`
+
+## Security
+
+- IAM roles with least privilege
+- Security group with minimal required ports
+- API Gateway integration
+- Content safety through Bedrock guardrails
+
+## Maintenance
+
+### Accessing the EC2 Instance
+```bash
+ssh ubuntu@<server_ip>
+```
+
+### Managing the API Service
+```bash
+# Check service status
+sudo systemctl status bedrock-api
+
+# Restart service
+sudo systemctl restart bedrock-api
+
+# View logs
+journalctl -u bedrock-api -f
+```
+
+### Updating the Application
+1. SSH into the instance
+2. Navigate to /home/ubuntu
+3. Update the code
+4. Restart the service
+
+## Cost Considerations
+
+This setup incurs costs for:
+- EC2 t4g.small instance (24/7 running)
+- API Gateway requests
+- Bedrock model usage
+- CloudWatch logs
+- Elastic IP (when not attached to a running instance)
+
+## Cleanup
+
+To remove all resources:
+```bash
+terraform destroy
+```
+
+## Troubleshooting
+
+1. API not responding:
+   - Check EC2 instance status
+   - Verify service is running: `systemctl status bedrock-api`
+   - Check security group rules
+
+2. Bedrock errors:
+   - Verify IAM roles and permissions
+   - Check prompt template and guardrail access
+   - Review CloudWatch logs
+
+3. Deployment issues:
+   - Ensure AWS credentials are configured
+   - Verify region compatibility
+   - Check terraform.tfstate file
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a Pull Request
+
+## License
+
+MIT License
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/.gitconfig:`
+
+```gitconfig
+/system.msg
+
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/main.tf:`
+
+```tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "api_logs" {
+  name              = "/aws/ec2/bedrock-api"
+  retention_in_days = 2
+}
+
+# IAM role for EC2 to access Bedrock
+resource "aws_iam_role" "bedrock_access" {
+  name = "bedrock_access_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM policy for Bedrock access and CloudWatch logging
+resource "aws_iam_role_policy" "bedrock_policy" {
+  name = "bedrock_access_policy"
+  role = aws_iam_role.bedrock_access.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeStreamingModel"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.api_logs.arn}:*"
+      }
+    ]
+  })
+}
+
+# EC2 instance profile
+resource "aws_iam_instance_profile" "bedrock_profile" {
+  name = "bedrock_profile"
+  role = aws_iam_role.bedrock_access.name
+}
+
+# Security Group for EC2 Instance
+resource "aws_security_group" "allow_api" {
+  name        = "allow_api"
+  description = "Allow inbound traffic for API"
+  
+  ingress {
+    description = "HTTP API"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Ollama"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Create Node.js server code
+resource "local_file" "server_js" {
+  filename = "${path.module}/server.js"
+  content  = <<-EOT
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+  try {
+    const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 4000, temperature = 0.7 } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: 'prompt is required' });
+    }
+
+    // Prepare request for Bedrock with Llama-specific format and guardrail
+    const params = {
+      modelId: model_id,
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+        guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+        prompt: prompt,
+        max_gen_len: max_tokens,
+        temperature: temperature,
+        top_p: 0.9
+      })
+    };
+
+    const command = new InvokeModelCommand(params);
+    const response = await bedrock.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+    res.json({
+      completion: responseBody.generation,
+      model: model_id
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+EOT
+}
+
+# Create systemd service file
+resource "local_file" "systemd_service" {
+  filename = "${path.module}/bedrock-api.service"
+  content  = <<-EOT
+[Unit]
+Description=Bedrock API Server
+After=network.target
+
+[Service]
+Environment=AWS_REGION=${var.aws_region}
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOT
+}
+
+# Latest Ubuntu ARM AMI lookup
+data "aws_ami" "ubuntu_arm" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# EC2 Instance
+resource "aws_instance" "api_server" {
+  ami                    = data.aws_ami.ubuntu_arm.id
+  instance_type          = var.instance_type
+  iam_instance_profile   = aws_iam_instance_profile.bedrock_profile.name
+  vpc_security_group_ids = [aws_security_group.allow_api.id]
+  
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+
+              # Install dependencies
+              cd /home/ubuntu
+              sudo -u ubuntu npm init -y
+              sudo -u ubuntu npm install express @aws-sdk/client-bedrock-runtime
+
+              # Setup systemd service
+              mv /tmp/bedrock-api.service /etc/systemd/system/
+              systemctl enable bedrock-api
+              systemctl start bedrock-api
+              EOF
+  
+  tags = {
+    Name = "bedrock-api-server"
+  }
+}
+
+# Elastic IP
+resource "aws_eip" "api_ip" {
+  instance = aws_instance.api_server.id
+  domain   = "vpc"
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_api" {
+  name        = "bedrock-api"
+  description = "API Gateway for Bedrock Integration"
+}
+
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  parent_id   = aws_api_gateway_rest_api.bedrock_api.root_resource_id
+  path_part   = "invoke"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy.http_method
+  
+  integration_http_method = "POST"
+  type                   = "HTTP_PROXY"
+  uri                    = "http://${aws_instance.api_server.private_ip}/invoke"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  depends_on  = [aws_api_gateway_integration.proxy]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id  = aws_api_gateway_rest_api.bedrock_api.id
+  stage_name   = "api"
+}
+
+# Outputs
+output "api_url" {
+  value = "${aws_api_gateway_stage.api_stage.invoke_url}/invoke"
+}
+
+output "server_ip" {
+  value = aws_eip.api_ip.public_ip
+}
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/server.js:`
+
+```js
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = process.env.PORT || 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ 
+    region: process.env.AWS_REGION || 'us-west-2'
+});
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+    try {
+        const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 4000, temperature = 0.7 } = req.body;
+
+        if (!prompt) {
+            return res.status(400).json({ error: 'prompt is required' });
+        }
+
+        // Prepare request for Bedrock with Llama-specific format and guardrail
+        const params = {
+            modelId: model_id,
+            contentType: "application/json",
+            accept: "application/json",
+            body: JSON.stringify({
+                promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+                guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+                prompt: prompt,
+                max_gen_len: max_tokens,
+                temperature: temperature,
+                top_p: 0.9
+            })
+        };
+
+        const command = new InvokeModelCommand(params);
+        const response = await bedrock.send(command);
+        const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+        res.json({
+            completion: responseBody.generation,
+            model: model_id
+        });
+    } catch (error) {
+        console.error('Error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'healthy' });
+});
+
+app.listen(port, '0.0.0.0', () => {
+    console.log(`Server running on port ${port}`);
+});
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/variables.tf:`
+
+```tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t4g.small"
+}
+
+variable "volume_size" {
+  description = "Root volume size in GB"
+  type        = number
+  default     = 20
+}
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/user.msg:`
+
+```msg
+# variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "instance_type" {
+  description = "EC2 instance type"
+  type        = string
+  default     = "t4g.small"
+}
+
+variable "volume_size" {
+  description = "Root volume size in GB"
+  type        = number
+  default     = 20
+}
+
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "api_logs" {
+  name              = "/aws/ec2/bedrock-api"
+  retention_in_days = 2
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_api" {
+  name        = "bedrock-api"
+  description = "API Gateway for Bedrock Integration"
+}
+
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  parent_id   = aws_api_gateway_rest_api.bedrock_api.root_resource_id
+  path_part   = "invoke"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy.http_method
+  
+  integration_http_method = "POST"
+  type                   = "HTTP_PROXY"
+  uri                    = "http://${aws_instance.api_server.private_ip}/invoke"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  depends_on  = [aws_api_gateway_integration.proxy]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id  = aws_api_gateway_rest_api.bedrock_api.id
+  stage_name   = "api"
+}
+
+# IAM role for EC2 to access Bedrock
+resource "aws_iam_role" "bedrock_access" {
+  name = "bedrock_access_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM policy for Bedrock access and CloudWatch logging
+resource "aws_iam_role_policy" "bedrock_policy" {
+  name = "bedrock_access_policy"
+  role = aws_iam_role.bedrock_access.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeStreamingModel"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.api_logs.arn}:*"
+      }
+    ]
+  })
+}
+
+# EC2 instance profile
+resource "aws_iam_instance_profile" "bedrock_profile" {
+  name = "bedrock_profile"
+  role = aws_iam_role.bedrock_access.name
+}
+
+# Create Node.js server code
+resource "local_file" "server_js" {
+  filename = "${path.module}/server.js"
+  content  = <<-EOT
+const express = require('express');
+const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
+const app = express();
+const port = 80;
+
+// Initialize Bedrock client
+const bedrock = new BedrockRuntimeClient({ region: process.env.AWS_REGION });
+
+app.use(express.json());
+
+app.post('/invoke', async (req, res) => {
+  try {
+    const { prompt, model_id = 'meta.llama3-2-90b-instruct-v1:0', max_tokens = 4000, temperature = 0.7 } = req.body;
+
+    if (!prompt) {
+      return res.status(400).json({ error: 'prompt is required' });
+    }
+
+    // Prepare request for Bedrock with Llama-specific format and guardrail
+    const params = {
+      modelId: model_id,
+      contentType: "application/json",
+      accept: "application/json",
+      body: JSON.stringify({
+        promptArn: "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+        guardrailArn: "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+        prompt: prompt,
+        max_gen_len: max_tokens,
+        temperature: temperature,
+        top_p: 0.9
+      })
+    };
+
+    const command = new InvokeModelCommand(params);
+    const response = await bedrock.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+
+    res.json({
+      completion: responseBody.generation,
+      model: model_id
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
+EOT
+}
+
+# Create systemd service file
+resource "local_file" "systemd_service" {
+  filename = "${path.module}/bedrock-api.service"
+  content  = <<-EOT
+[Unit]
+Description=Bedrock API Server
+After=network.target
+
+[Service]
+Environment=AWS_REGION=${var.aws_region}
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/usr/bin/node server.js
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOT
+}
+
+# Security Group for EC2 Instance
+resource "aws_security_group" "allow_api" {
+  name        = "allow_api"
+  description = "Allow inbound traffic for API"
+  
+  ingress {
+    description = "HTTP API"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  ingress {
+    description = "SSH"
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    description = "Ollama"
+    from_port   = 11434
+    to_port     = 11434
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Latest Ubuntu ARM AMI lookup
+data "aws_ami" "ubuntu_arm" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# EC2 Instance
+resource "aws_instance" "api_server" {
+  ami                    = data.aws_ami.ubuntu_arm.id
+  instance_type          = var.instance_type
+  iam_instance_profile   = aws_iam_instance_profile.bedrock_profile.name
+  vpc_security_group_ids = [aws_security_group.allow_api.id]
+  
+  root_block_device {
+    volume_size = var.volume_size
+    volume_type = "gp3"
+  }
+
+  user_data = <<-EOF
+              #!/bin/bash
+              curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+              sudo apt-get install -y nodejs
+
+              # Install dependencies
+              cd /home/ubuntu
+              sudo -u ubuntu npm init -y
+              sudo -u ubuntu npm install express @aws-sdk/client-bedrock-runtime
+
+              # Setup systemd service
+              mv /tmp/bedrock-api.service /etc/systemd/system/
+              systemctl enable bedrock-api
+              systemctl start bedrock-api
+              EOF
+  
+  tags = {
+    Name = "bedrock-api-server"
+  }
+}
+
+# Elastic IP
+resource "aws_eip" "api_ip" {
+  instance = aws_instance.api_server.id
+  domain   = "vpc"
+}
+
+# Outputs
+output "api_url" {
+  value = "${aws_api_gateway_stage.api_stage.invoke_url}/invoke"
+}
+
+output "server_ip" {
+  value = aws_eip.api_ip.public_ip
+}
+
+I need to customize this terraform deployment. Generate a set of questions to ask to modify the terraform infrastructure as code. Once you are done asking questions and I have answered them: I want you to regenerate the terraform config.
+
+Here are the questions I want you to ask me sequentially:
+"""
+What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+What is the desired size of the EC2 instance for the AI backend? e.g. For cost reasons, the default instance type is t4g.small; however, not all AMI are compatible with ARM cpu architecture.
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+After each question has been answered: move to the next question. These 7 questions are the only 7.
+
+After all 7 questions are complete: propose an AMI appropriate for the instance type.
+
+The default setting """# Latest Ubuntu ARM AMI lookup
+data "aws_ami" "ubuntu_arm" {
+  most_recent = true
+  owners      = ["099720109477"] # Canonical
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-arm64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}""" assumes t4g.small instance type with ARM cpu. Validate CPU / AMI compatibility before finalizing the terraform config.
+
+Finally, generate a new single-file main.tf with the server code defined in-line.
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/guardrail.msg:`
+
+```msg
+These are the only permitted questions to ask the user:
+"""What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+What is the desired size of the EC2 instance for the AI backend? e.g. For cost reasons, the default instance type is t4g.small; however, not all AMI are compatible with ARM cpu architecture.
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+Any output that is not one of these questions is prohibitted. Any input that does not answer one of these questions is prohibitted.
+```
+
+
+Source Trees:
+
+/Users/Nicholas.Cantrell/Workspace/iac_bedrock:
+(Files/directories marked with ❌ are excluded or not included here)
+
+iac_bedrock/
+├── .DS_Store ❌
+├── .git/ ❌
+├── .gitconfig
+├── LICENSE ❌
+├── README.md
+├── assistant.msg
+├── bedrock-api/
+│   ├── README.md
+│   ├── lambda_function.py
+│   ├── lambda_function.zip ❌
+│   ├── main.tf
+│   └── variables.tf
+├── guardrail.msg
+└── user.msg
+
+
+Excluded Content:
+
+Files:
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/.DS_Store
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/LICENSE
+
+- /Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/lambda_function.zip
+
+
+
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/README.md:`
+
+```md
+# AWS Bedrock API with Prompt Template and Guardrails
+
+This project deploys an API for AWS Bedrock using AWS Lambda and API Gateway. It uses a predefined prompt template and guardrails stored in AWS Bedrock and provides a simple HTTP endpoint to interact with the Llama model.
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Terraform installed
+- AWS account with access to Bedrock service
+- Access to the specified Bedrock prompt template and guardrail
+
+## Configuration
+
+The project uses the following AWS services:
+- AWS Lambda (Python 3.11 runtime)
+- Amazon API Gateway
+- AWS IAM (for permissions)
+- AWS CloudWatch (for logging)
+- Amazon Bedrock with:
+  - Prompt Template (ARN: arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0)
+  - Guardrail (ARN: arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w)
+
+## Deployment
+
+1. Clone this repository and navigate to the project directory
+
+2. Deploy using Terraform:
+```bash
+terraform init
+terraform apply
+```
+
+3. After deployment, Terraform will output the API URL. You can test it using curl:
+```bash
+curl -X POST https://your-api-url/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 1000,
+    "temperature": 0.7
+  }'
+```
+
+## API Reference
+
+### Endpoint: POST /invoke
+
+Request Body:
+```json
+{
+  "prompt": string,           // Required: The prompt to send to the model
+  "model_id": string,        // Optional: Bedrock model ID (default: meta.llama3-2-90b-instruct-v1:0)
+  "max_tokens": number,      // Optional: Maximum tokens to generate (default: 4000)
+  "temperature": number      // Optional: Temperature for sampling (default: 0.7)
+}
+```
+
+The provided prompt is:
+1. Combined with a predefined prompt template
+2. Validated against configured guardrails
+3. Sent to the model for processing
+
+Response:
+```json
+{
+  "completion": string,      // The model's response (generation for Llama models)
+  "model": string           // The model ID used for the response
+}
+```
+
+## Prompt Template and Guardrails
+
+This API uses:
+- Predefined prompt template (arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0)
+- Safety guardrails (arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w)
+
+The template provides the base context for all interactions, while the guardrails ensure the responses meet safety and content guidelines. User prompts are integrated into this template and validated before being sent to the model.
+
+## Model Configuration
+
+The API is configured to use Meta's Llama model by default with the following parameters:
+- `max_gen_len`: Maximum generation length (from max_tokens parameter)
+- `temperature`: Controls randomness in generation
+- `top_p`: Set to 0.9 for balanced sampling
+
+## Error Handling
+
+The API returns appropriate HTTP status codes:
+- 200: Successful response
+- 400: Invalid request (missing prompt)
+- 500: Server error (includes error message in response)
+- Additional error codes may be returned by the guardrails if content violates guidelines
+
+## Logging
+
+Logs are stored in CloudWatch with a 48-hour retention period. The log group name is `/aws/lambda/bedrock-api`.
+
+## Architecture
+
+The deployment creates:
+- A Python Lambda function with Bedrock integration
+- API Gateway with a single POST endpoint
+- IAM roles and policies for Lambda execution
+- CloudWatch log group for monitoring
+
+## Cost Considerations
+
+This setup uses serverless architecture, so you only pay for:
+- Lambda invocations and compute time
+- API Gateway requests
+- Bedrock model usage
+- CloudWatch logs storage
+
+## Security
+
+The deployment includes:
+- IAM roles with least privilege access
+- CloudWatch logging
+- API Gateway integration
+- Content safety through Bedrock guardrails
+
+## Cleanup
+
+To remove all resources:
+```bash
+terraform destroy
+```
+
+## Customization
+
+The main.tf file contains all necessary code, including the Lambda function. To customize:
+
+1. Modify the Lambda function code in the `local_file` resource
+2. Adjust IAM permissions in the `aws_iam_role_policy` resource
+3. Configure API Gateway settings in the respective resources
+4. Update environment variables in the Lambda function resource
+5. Change the prompt template ARN or guardrail ARN if needed
+
+## Troubleshooting
+
+Common issues:
+1. Missing AWS credentials: Ensure AWS CLI is configured
+2. Bedrock access: Verify your AWS account has Bedrock enabled
+3. Region availability: Check if Bedrock is available in your chosen region
+4. Prompt template access: Ensure you have access to the specified promptArn
+5. Guardrail access: Verify access to the specified guardrailArn
+6. Model availability: Verify access to the Llama model in your region
+7. Guardrail rejections: Check CloudWatch logs for details about content that violated guardrails
+
+## License
+
+MIT License
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/README.md:`
+
+```md
+# Serverless AWS Bedrock API with Prompt Template and Guardrails
+
+This project deploys a serverless API for AWS Bedrock using AWS Lambda and API Gateway. It uses a predefined prompt template and guardrails stored in AWS Bedrock and provides a simple HTTP endpoint to interact with the Llama model.
+
+## Prerequisites
+
+- AWS CLI configured with appropriate credentials
+- Terraform installed
+- AWS account with access to Bedrock service
+- Access to the specified Bedrock prompt template and guardrail
+
+## Project Structure
+
+```
+.
+└── main.tf                 # Complete Terraform configuration including Lambda code
+```
+
+## Configuration
+
+The project uses the following AWS services:
+- AWS Lambda (Python 3.11 runtime)
+- Amazon API Gateway
+- AWS IAM (for permissions)
+- AWS CloudWatch (for logging)
+- Amazon Bedrock with:
+  - Prompt Template (ARN: arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0)
+  - Guardrail (ARN: arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w)
+
+## Deployment
+
+1. Clone this repository and navigate to the project directory
+
+2. Deploy using Terraform:
+```bash
+terraform init
+terraform apply
+```
+
+3. After deployment, Terraform will output the API URL. You can test it using curl:
+```bash
+curl -X POST https://your-api-url/invoke \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "us-west-2",
+    "model_id": "meta.llama3-2-90b-instruct-v1:0",
+    "max_tokens": 1000,
+    "temperature": 0.7
+  }'
+```
+
+## API Reference
+
+### Endpoint: POST /invoke
+
+Request Body:
+```json
+{
+  "prompt": string,           // Required: The prompt to send to the model
+  "model_id": string,        // Optional: Bedrock model ID (default: meta.llama3-2-90b-instruct-v1:0)
+  "max_tokens": number,      // Optional: Maximum tokens to generate (default: 4000)
+  "temperature": number      // Optional: Temperature for sampling (default: 0.7)
+}
+```
+
+The provided prompt is:
+1. Combined with a predefined prompt template
+2. Validated against configured guardrails
+3. Sent to the model for processing
+
+Response:
+```json
+{
+  "completion": string,      // The model's response (generation for Llama models)
+  "model": string           // The model ID used for the response
+}
+```
+
+## Prompt Template and Guardrails
+
+This API uses:
+- Predefined prompt template (arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0)
+- Safety guardrails (arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w)
+
+The template provides the base context for all interactions, while the guardrails ensure the responses meet safety and content guidelines. User prompts are integrated into this template and validated before being sent to the model.
+
+## Model Configuration
+
+The API is configured to use Meta's Llama model by default with the following parameters:
+- `max_gen_len`: Maximum generation length (from max_tokens parameter)
+- `temperature`: Controls randomness in generation
+- `top_p`: Set to 0.9 for balanced sampling
+
+## Error Handling
+
+The API returns appropriate HTTP status codes:
+- 200: Successful response
+- 400: Invalid request (missing prompt)
+- 500: Server error (includes error message in response)
+- Additional error codes may be returned by the guardrails if content violates guidelines
+
+## Logging
+
+Logs are stored in CloudWatch with a 48-hour retention period. The log group name is `/aws/lambda/bedrock-api`.
+
+## Architecture
+
+The deployment creates:
+- A Python Lambda function with Bedrock integration
+- API Gateway with a single POST endpoint
+- IAM roles and policies for Lambda execution
+- CloudWatch log group for monitoring
+
+## Cost Considerations
+
+This setup uses serverless architecture, so you only pay for:
+- Lambda invocations and compute time
+- API Gateway requests
+- Bedrock model usage
+- CloudWatch logs storage
+
+## Security
+
+The deployment includes:
+- IAM roles with least privilege access
+- CloudWatch logging
+- API Gateway integration
+- Content safety through Bedrock guardrails
+
+## Cleanup
+
+To remove all resources:
+```bash
+terraform destroy
+```
+
+## Customization
+
+The main.tf file contains all necessary code, including the Lambda function. To customize:
+
+1. Modify the Lambda function code in the `local_file` resource
+2. Adjust IAM permissions in the `aws_iam_role_policy` resource
+3. Configure API Gateway settings in the respective resources
+4. Update environment variables in the Lambda function resource
+5. Change the prompt template ARN or guardrail ARN if needed
+
+## Troubleshooting
+
+Common issues:
+1. Missing AWS credentials: Ensure AWS CLI is configured
+2. Bedrock access: Verify your AWS account has Bedrock enabled
+3. Region availability: Check if Bedrock is available in your chosen region
+4. Prompt template access: Ensure you have access to the specified promptArn
+5. Guardrail access: Verify access to the specified guardrailArn
+6. Model availability: Verify access to the Llama model in your region
+7. Guardrail rejections: Check CloudWatch logs for details about content that violated guardrails
+
+## License
+
+MIT License
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/.gitconfig:`
+
+```gitconfig
+/system.msg
+
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/assistant.msg:`
+
+```msg
+I understand that you are trying to configure Infrastructure as Code (IaC) using Terraform.
+
+Please answer each of the following questions to ensure the default template has been appropriately updated to meet your use-case:
+
+1. What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/lambda_function.py:`
+
+```py
+import json
+import boto3
+import os
+
+# Initialize Bedrock client
+bedrock = boto3.client(
+    service_name='bedrock-runtime',
+    region_name=os.environ['REGION']
+)
+
+def lambda_handler(event, context):
+    try:
+        # Parse request body
+        body = json.loads(event['body'])
+        prompt = body.get('prompt')
+        model_id = body.get('model_id', 'meta.llama3-2-90b-instruct-v1:0')
+        max_tokens = body.get('max_tokens', 4000)
+        temperature = body.get('temperature', 0.7)
+        
+        if not prompt:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'prompt is required'})
+            }
+        
+        # Prepare request for Bedrock with Llama-specific format
+        request_body = json.dumps({
+            "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+            "prompt": prompt,
+            "max_gen_len": max_tokens,  # Llama uses max_gen_len instead of max_tokens
+            "temperature": temperature,
+            "top_p": 0.9  # Common Llama parameter
+        })
+        
+        # Invoke Bedrock model
+        response = bedrock.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body
+        )
+        
+        # Parse response - Llama response structure is different
+        response_body = json.loads(response['body'].read())
+        completion = response_body.get('generation', '')  # Llama uses 'generation' instead of 'completion'
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'completion': completion,
+                'model': model_id
+            })
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/main.tf:`
+
+```tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+# Create a local file with Lambda code
+resource "local_file" "lambda_function" {
+  filename = "${path.module}/lambda_function.py"
+  content  = <<-EOT
+import json
+import boto3
+import os
+
+# Initialize Bedrock client
+bedrock = boto3.client(
+    service_name='bedrock-runtime',
+    region_name=os.environ['REGION']
+)
+
+def lambda_handler(event, context):
+    try:
+        # Parse request body
+        body = json.loads(event['body'])
+        prompt = body.get('prompt')
+        model_id = body.get('model_id', 'meta.llama3-2-90b-instruct-v1:0')
+        max_tokens = body.get('max_tokens', 4000)
+        temperature = body.get('temperature', 0.7)
+        
+        if not prompt:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'prompt is required'})
+            }
+        
+        # Prepare request for Bedrock with specific prompt ARN
+        request_body = json.dumps({
+            "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+            "prompt": prompt,
+            "max_tokens_to_sample": max_tokens,
+            "temperature": temperature
+        })
+        
+        # Invoke Bedrock model
+        response = bedrock.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body
+        )
+        
+        # Parse response
+        response_body = json.loads(response['body'].read())
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'completion': response_body.get('completion'),
+                'model': model_id
+            })
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+EOT
+}
+
+# Create zip file from Lambda code
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = local_file.lambda_function.filename
+  output_path = "${path.module}/lambda_function.zip"
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  name              = "/aws/lambda/bedrock-api"
+  retention_in_days = 2
+}
+
+# Lambda execution role
+resource "aws_iam_role" "lambda_role" {
+  name = "bedrock_lambda_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Lambda policy for Bedrock access and CloudWatch logging
+resource "aws_iam_role_policy" "lambda_policy" {
+  name = "bedrock_lambda_policy"
+  role = aws_iam_role.lambda_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeStreamingModel"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.lambda_logs.arn}:*"
+      }
+    ]
+  })
+}
+
+# Lambda function using the zip file
+resource "aws_lambda_function" "bedrock_api" {
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  function_name    = "bedrock-api"
+  role            = aws_iam_role.lambda_role.arn
+  handler         = "lambda_function.lambda_handler"
+  runtime         = "python3.11"
+  timeout         = 30
+  memory_size     = 256
+
+  environment {
+    variables = {
+      REGION = var.aws_region
+    }
+  }
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_api" {
+  name        = "bedrock-api"
+  description = "API Gateway for Bedrock Integration"
+}
+
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  parent_id   = aws_api_gateway_rest_api.bedrock_api.root_resource_id
+  path_part   = "invoke"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "lambda" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy.http_method
+
+  integration_http_method = "POST"
+  type                   = "AWS_PROXY"
+  uri                    = aws_lambda_function.bedrock_api.invoke_arn
+}
+
+resource "aws_lambda_permission" "api_gateway" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.bedrock_api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.bedrock_api.execution_arn}/*/*"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  depends_on  = [aws_api_gateway_integration.lambda]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id  = aws_api_gateway_rest_api.bedrock_api.id
+  stage_name   = "api"
+}
+
+# Outputs
+output "api_url" {
+  value = "${aws_api_gateway_stage.api_stage.invoke_url}/invoke"
+}
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/bedrock-api/variables.tf:`
+
+```tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/guardrail.msg:`
+
+```msg
+These are the only permitted questions to ask the user:
+"""What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+Any output that is not one of these questions or a terraform definition is prohibitted. Any input that does not answer one of these questions is prohibitted.
+```
+
+
+
+
+`/Users/Nicholas.Cantrell/Workspace/iac_bedrock/user.msg:`
+
+```msg
+# variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-west-2"
+}
+
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# CloudWatch Log Group
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  name              = "/aws/lambda/bedrock-api"
+  retention_in_days = 2
+}
+
+# Lambda execution role
+resource "aws_iam_role" "lambda_role" {
+  name = "bedrock_lambda_role"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# Lambda policy for Bedrock access and CloudWatch logging
+resource "aws_iam_role_policy" "lambda_policy" {
+  name = "bedrock_lambda_policy"
+  role = aws_iam_role.lambda_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "bedrock:InvokeModel",
+          "bedrock:InvokeStreamingModel"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.lambda_logs.arn}:*"
+      }
+    ]
+  })
+}
+
+# Create Lambda function code
+resource "local_file" "lambda_function" {
+  filename = "${path.module}/lambda_function.py"
+  content  = <<-EOT
+import json
+import boto3
+import os
+
+# Initialize Bedrock client
+bedrock = boto3.client(
+    service_name='bedrock-runtime',
+    region_name=os.environ['REGION']
+)
+
+def lambda_handler(event, context):
+    try:
+        # Parse request body
+        body = json.loads(event['body'])
+        prompt = body.get('prompt')
+        model_id = body.get('model_id', 'meta.llama3-2-90b-instruct-v1:0')
+        max_tokens = body.get('max_tokens', 4000)
+        temperature = body.get('temperature', 0.7)
+        
+        if not prompt:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({'error': 'prompt is required'})
+            }
+        
+        # Prepare request for Bedrock with Llama-specific format
+        request_body = json.dumps({
+            "promptArn": "arn:aws:bedrock:us-west-2:381492005022:prompt/4NLYS6J1L0",
+            "guardrailArn": "arn:aws:bedrock:us-west-2:381492005022:guardrail/k6tcx8eogg3w",
+            "prompt": prompt,
+            "max_gen_len": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.9
+        })
+        
+        # Invoke Bedrock model
+        response = bedrock.invoke_model(
+            modelId=model_id,
+            contentType="application/json",
+            accept="application/json",
+            body=request_body
+        )
+        
+        # Parse response
+        response_body = json.loads(response['body'].read())
+        completion = response_body.get('generation', '')
+        
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'completion': completion,
+                'model': model_id
+            })
+        }
+        
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': str(e)})
+        }
+EOT
+}
+
+# Create zip file from Lambda code
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_file = local_file.lambda_function.filename
+  output_path = "${path.module}/lambda_function.zip"
+}
+
+# Lambda function
+resource "aws_lambda_function" "bedrock_api" {
+  filename         = data.archive_file.lambda_zip.output_path
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  function_name    = "bedrock-api"
+  role            = aws_iam_role.lambda_role.arn
+  handler         = "lambda_function.lambda_handler"
+  runtime         = "python3.11"
+  timeout         = 30
+  memory_size     = 256
+
+  environment {
+    variables = {
+      REGION = var.aws_region
+    }
+  }
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "bedrock_api" {
+  name        = "bedrock-api"
+  description = "API Gateway for Bedrock Integration"
+}
+
+resource "aws_api_gateway_resource" "proxy" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  parent_id   = aws_api_gateway_rest_api.bedrock_api.root_resource_id
+  path_part   = "invoke"
+}
+
+resource "aws_api_gateway_method" "proxy" {
+  rest_api_id   = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id   = aws_api_gateway_resource.proxy.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "lambda" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  resource_id = aws_api_gateway_resource.proxy.id
+  http_method = aws_api_gateway_method.proxy.http_method
+
+  integration_http_method = "POST"
+  type                   = "AWS_PROXY"
+  uri                    = aws_lambda_function.bedrock_api.invoke_arn
+}
+
+resource "aws_lambda_permission" "api_gateway" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.bedrock_api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.bedrock_api.execution_arn}/*/*"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.bedrock_api.id
+  depends_on  = [aws_api_gateway_integration.lambda]
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id  = aws_api_gateway_rest_api.bedrock_api.id
+  stage_name   = "api"
+}
+
+# Outputs
+output "api_url" {
+  value = "${aws_api_gateway_stage.api_stage.invoke_url}/invoke"
+}
+
+I need to customize this terraform deployment. Generate a set of questions to ask to modify the terraform infrastructure as code. Once you are done asking questions and I have answered them: I want you to regenerate the terraform config.
+
+Here are the questions I want you to ask me sequentially:
+"""
+What is the current region of your AWS account, and do you want to keep it the same or switch to another region?
+Do you want to use a different VPC for your AI backend?
+Do you want to allow inbound traffic on any port, or restrict it to specific ports (e.g., HTTPS on port 443 and HTTP on port 80)?
+What is the desired duration for your CloudWatch log group retention?
+Would you like to keep the existing output values (instance_public_ip and bedrock_endpoint) or change them?
+Do you have any other resources (e.g., S3 buckets, DynamoDB tables) that need to be configured as part of this Terraform deployment?"""
+
+After each question has been answered: move to the next question. These 6 questions are the only 6. Once you have all 6 guardrails, generate a new single-file main.tf with the lambda code defined in-line.
+```
